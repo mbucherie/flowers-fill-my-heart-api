@@ -157,4 +157,75 @@ router.get("/:id", requireAuth, async (req, res) => {
   }
 });
 
-module.exports = router;
+router.put("/:id", requireAuth, async (req, res) => {
+  try {
+    const designId = Number(req.params.id);
+
+    if (!Number.isInteger(designId) || designId <= 0) {
+      return res.status(400).json({
+        error: "Invalid design ID."
+      });
+    }
+
+    const {
+      designName,
+      heartSize,
+      designData
+    } = req.body;
+
+    if (!designName || !heartSize || !designData) {
+      return res.status(400).json({
+        error: "Design name, heart size, and design data are required."
+      });
+    }
+
+    const normalizedName = String(designName).trim();
+    const normalizedHeartSize = String(heartSize).trim();
+
+    if (!normalizedName || !normalizedHeartSize) {
+      return res.status(400).json({
+        error: "Design name and heart size are required."
+      });
+    }
+
+    if (normalizedName.length > 100) {
+      return res.status(400).json({
+        error: "Design name must be 100 characters or fewer."
+      });
+    }
+
+    const [result] = await pool.query(
+      `UPDATE saved_designs
+       SET design_name = ?,
+           heart_size = ?,
+           design_data = ?
+       WHERE id = ?
+         AND user_id = ?`,
+      [
+        normalizedName,
+        normalizedHeartSize,
+        JSON.stringify(designData),
+        designId,
+        req.user.id
+      ]
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({
+        error: "Saved design not found."
+      });
+    }
+
+    return res.status(200).json({
+      message: "Design updated successfully."
+    });
+
+  } catch (error) {
+    console.error("UPDATE DESIGN ERROR:", error);
+
+    return res.status(500).json({
+      error: "Unable to update design."
+    });
+  }
+});
+module.exports = router;  
