@@ -228,4 +228,42 @@ router.put("/:id", requireAuth, async (req, res) => {
     });
   }
 });
+router.delete("/:id", requireAuth, async (req, res) => {
+  try {
+    const designId = Number(req.params.id);
+
+    if (!Number.isInteger(designId) || designId <= 0) {
+      return res.status(400).json({
+        error: "Invalid design ID."
+      });
+    }
+
+    const [result] = await pool.query(
+      `DELETE FROM saved_designs
+       WHERE id = ?
+         AND user_id = ?`,
+      [
+        designId,
+        req.user.id
+      ]
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({
+        error: "Saved design not found."
+      });
+    }
+
+    return res.status(200).json({
+      message: "Design deleted successfully."
+    });
+
+  } catch (error) {
+    console.error("DELETE DESIGN ERROR:", error);
+
+    return res.status(500).json({
+      error: "Unable to delete design."
+    });
+  }
+});
 module.exports = router;  
