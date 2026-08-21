@@ -98,5 +98,63 @@ router.get("/", requireAuth, async (req, res) => {
     });
   }
 });
+router.get("/:id", requireAuth, async (req, res) => {
+  try {
+    const designId = Number(req.params.id);
+
+    if (!Number.isInteger(designId) || designId <= 0) {
+      return res.status(400).json({
+        error: "Invalid design ID."
+      });
+    }
+
+    const [rows] = await pool.query(
+      `SELECT
+         id,
+         design_name,
+         heart_size,
+         design_data,
+         created_at,
+         updated_at
+       FROM saved_designs
+       WHERE id = ?
+         AND user_id = ?
+       LIMIT 1`,
+      [
+        designId,
+        req.user.id
+      ]
+    );
+
+    if (rows.length === 0) {
+      return res.status(404).json({
+        error: "Saved design not found."
+      });
+    }
+
+    const design = rows[0];
+
+    return res.status(200).json({
+      design: {
+        id: design.id,
+        designName: design.design_name,
+        heartSize: design.heart_size,
+        designData:
+          typeof design.design_data === "string"
+            ? JSON.parse(design.design_data)
+            : design.design_data,
+        createdAt: design.created_at,
+        updatedAt: design.updated_at
+      }
+    });
+
+  } catch (error) {
+    console.error("LOAD DESIGN ERROR:", error);
+
+    return res.status(500).json({
+      error: "Unable to load saved design."
+    });
+  }
+});
 
 module.exports = router;
