@@ -1,0 +1,12 @@
+node_modules/
+.env
+
+check-account.js
+check-saved-design.js
+check-saved-designs-table.js
+check-session.js
+check-sessions-table.js
+create-saved-designs-table.js
+create-sessions-table.js
+reset-test-password.js
+test-password.js
