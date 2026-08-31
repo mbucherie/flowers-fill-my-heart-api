@@ -33,6 +33,26 @@ router.post("/", requireAuth, async (req, res) => {
       });
     }
 
+    // CHECK SAVED DESIGN LIMIT
+   const [countRows] = await pool.query(
+   `SELECT COUNT(*) AS total
+   FROM saved_designs
+   WHERE user_id = ?`,
+   [req.user.id]
+  );
+
+  const savedDesignCount = countRows[0].total;
+
+  const MAX_SAVED_DESIGNS = 50;
+
+  if (savedDesignCount >= MAX_SAVED_DESIGNS) {
+  return res.status(400).json({
+    error:
+      "You have reached your maximum of 50 saved designs. Please delete an existing design before saving a new one."
+  });
+}
+
+
     await pool.query(
       `INSERT INTO saved_designs
         (user_id, design_name, heart_size, design_data)

@@ -114,7 +114,14 @@ router.post("/login", async (req, res) => {
     const normalizedUserId = userId.trim();
 
     const [users] = await pool.query(
-      `SELECT id, account_number, email, user_id, password_hash
+      `SELECT id, account_number, email, user_id, password_hash, has_subscription, subscription_provider,
+  subscription_id,
+  subscription_plan,
+  subscription_status,
+  subscription_start_date,
+  subscription_end_date,
+  subscription_cancelled_date,
+  reactivation_deadline
        FROM users
        WHERE user_id = ?
        LIMIT 1`,
@@ -164,7 +171,16 @@ router.post("/login", async (req, res) => {
       user: {
         accountNumber: user.account_number,
         email: user.email,
-        userId: user.user_id
+        userId: user.user_id,
+        hasSubscription: user.has_subscription,
+        subscriptionProvider: user.subscription_provider,
+        subscriptionId: user.subscription_id,
+        subscriptionPlan: user.subscription_plan,
+        subscriptionStatus: user.subscription_status,
+        subscriptionStartDate: user.subscription_start_date,
+        subscriptionEndDate: user.subscription_end_date,
+        subscriptionCancelledDate: user.subscription_cancelled_date,
+        reactivationDeadline: user.reactivation_deadline
       }
     });
 
