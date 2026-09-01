@@ -35,7 +35,8 @@ router.post("/create", async (req, res) => {
 
     if (!normalizedEmail || !normalizedUserId || password.length < 8) {
       return res.status(400).json({
-        error: "Please provide valid account information. Password must be at least 8 characters."
+        error:
+          "Please provide valid account information. Password must be at least 8 characters."
       });
     }
 
@@ -91,7 +92,6 @@ router.post("/create", async (req, res) => {
       accountNumber,
       userId: normalizedUserId
     });
-
   } catch (error) {
     console.error("ACCOUNT CREATION ERROR:", error);
 
@@ -114,14 +114,20 @@ router.post("/login", async (req, res) => {
     const normalizedUserId = userId.trim();
 
     const [users] = await pool.query(
-      `SELECT id, account_number, email, user_id, password_hash, has_subscription, subscription_provider,
-  subscription_id,
-  subscription_plan,
-  subscription_status,
-  subscription_start_date,
-  subscription_end_date,
-  subscription_cancelled_date,
-  reactivation_deadline
+      `SELECT
+        id,
+        account_number,
+        email,
+        user_id,
+        password_hash,
+        has_subscription,
+        subscription_provider,
+        subscription_id,
+        subscription_plan,
+        subscription_status,
+        subscription_start_date,
+        subscription_end_date,
+        subscription_cancelled_date
        FROM users
        WHERE user_id = ?
        LIMIT 1`,
@@ -179,11 +185,10 @@ router.post("/login", async (req, res) => {
         subscriptionStatus: user.subscription_status,
         subscriptionStartDate: user.subscription_start_date,
         subscriptionEndDate: user.subscription_end_date,
-        subscriptionCancelledDate: user.subscription_cancelled_date,
-        reactivationDeadline: user.reactivation_deadline
+        subscriptionCancelledDate:
+          user.subscription_cancelled_date
       }
     });
-
   } catch (error) {
     console.error("LOGIN ERROR:", error);
 
