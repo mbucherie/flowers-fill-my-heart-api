@@ -10,7 +10,7 @@ const paymentRoutes = require("./routes/payments");
 const app = express();
 
 app.use(cors());
-app.use(express.json());
+
 
 app.get("/api/health", (req, res) => {
   res.json({
@@ -18,6 +18,19 @@ app.get("/api/health", (req, res) => {
     service: "Flowers Fill My Heart API"
   });
 });
+
+
+// PayPal webhook needs the raw request body for signature verification.
+app.use(
+"/api/payments/paypal-webhook",
+express.raw({ type: "application/json" })
+);
+
+app.use(
+  express.json({
+    type: (req) => req.originalUrl !== "/api/payments/paypal-webhook"
+  })
+);
 
 app.use("/api/accounts", accountRoutes);
 

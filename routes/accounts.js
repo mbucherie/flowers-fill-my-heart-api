@@ -193,11 +193,12 @@ router.post("/login", async (req, res) => {
     console.error("LOGIN ERROR:", error);
 
     return res.status(500).json({
-      error: "Unable to log in.",
-      code: error.code || null,
-      message: error.message || null
-    });
+      error: "Unable to log in."
+  
+   });
+
   }
-});
+
+  });
 
 module.exports = router;
