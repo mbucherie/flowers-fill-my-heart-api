@@ -201,4 +201,43 @@ router.post("/login", async (req, res) => {
 
   });
 
+  router.post("/logout", async (req, res) => {
+  try {
+    const authorization = req.headers.authorization;
+
+    if (!authorization || !authorization.startsWith("Bearer ")) {
+      return res.status(200).json({
+        message: "Logout successful."
+      });
+    }
+
+    const sessionToken = authorization.slice(7).trim();
+
+    if (!sessionToken) {
+      return res.status(200).json({
+        message: "Logout successful."
+      });
+    }
+
+    const tokenHash = hashSessionToken(sessionToken);
+
+    await pool.query(
+      `DELETE FROM sessions
+       WHERE token_hash = ?`,
+      [tokenHash]
+    );
+
+    return res.status(200).json({
+      message: "Logout successful."
+    });
+
+  } catch (error) {
+    console.error("LOGOUT ERROR:", error);
+
+    return res.status(500).json({
+      error: "Unable to log out."
+    });
+  }
+});
+
 module.exports = router;
