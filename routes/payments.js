@@ -496,8 +496,9 @@ router.post(
   "/paypal-webhook",
   express.raw({ type: "application/json" }),
   async (req, res) => {
-    try {
-     let connection = null; 
+        let connection = null; 
+        
+         try {
      
       // ------------------------------------------------
       // 1. PRESERVE THE RAW BODY
