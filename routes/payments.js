@@ -102,8 +102,8 @@ async function verifyPayPalWebhook(req, webhookEvent) {
 
   const expectedCertHost =
     process.env.PAYPAL_MODE === "live"
-      ? "api-m.paypal.com"
-      : "api-m.sandbox.paypal.com";
+      ? "api.paypal.com"
+      : "api.sandbox.paypal.com";
 
   if (
     certUrl.protocol !== "https:" ||
@@ -497,7 +497,7 @@ router.post(
   express.raw({ type: "application/json" }),
   async (req, res) => {
         let connection = null; 
-        
+
          try {
      
       // ------------------------------------------------
@@ -673,6 +673,8 @@ router.post(
       // ------------------------------------------------
 
       connection = await pool.getConnection();
+
+      console.log("PAYPAL WEBHOOK: Signature verified");
 
       await connection.beginTransaction();
 
