@@ -1,11 +1,33 @@
 const express = require("express");
 const paypal = require("@paypal/paypal-server-sdk");
+const crypto = require("crypto");
 
 const pool = require("../db/connection");
 const requireAuth = require("../middleware/auth");
 const paypalClient = require("../config/paypal");
 
 const router = express.Router();
+function generateAccountNumber() {
+  return "FMH" + crypto.randomInt(10000000, 100000000);
+}
+
+async function generateUniqueAccountNumber() {
+  let accountNumber;
+  let accountNumberExists = true;
+
+  while (accountNumberExists) {
+    accountNumber = generateAccountNumber();
+
+    const [existingAccount] = await pool.query(
+      "SELECT id FROM users WHERE account_number = ? LIMIT 1",
+      [accountNumber]
+    );
+
+    accountNumberExists = existingAccount.length > 0;
+  }
+
+  return accountNumber;
+}
 
 const PAYPAL_BASE_URL =
   process.env.PAYPAL_MODE === "live"
@@ -267,32 +289,49 @@ router.post(
           ?.nextBillingTime
       );
 
-      // Associate this PayPal subscription with the
-      // authenticated local account.
-    await pool.query(
-  `UPDATE users
-   SET has_subscription = ?,
-       subscription_provider = 'paypal',
-       subscription_id = ?,
-       subscription_plan = ?,
-       subscription_status = ?,
-       subscription_start_date = ?,
-       subscription_end_date = ?,
-       subscription_cancelled_date = NULL
-   WHERE id = ?`,
-  [
-    subscriptionStatus === "ACTIVE" ? 1 : 0,
-    subscriptionId,
-    subscriptionPlan,
-    subscriptionStatus,
-    startDate,
-    endDate,
-    req.user.id
-  ]
-);
+       // Generate an account number only after successful
+      // confirmation of an ACTIVE PayPal subscription.
+      let accountNumber = null;
+
+      if (subscriptionStatus === "ACTIVE") {
+        const [currentUser] = await pool.query(
+          "SELECT account_number FROM users WHERE id = ? LIMIT 1",
+          [req.user.id]
+        );
+
+       accountNumber = currentUser[0]?.account_number || null;
+
+       if (!accountNumber) {
+          accountNumber = await generateUniqueAccountNumber();
+        }
+      }
+   await pool.query(
+    `UPDATE users
+     SET account_number = COALESCE(?, account_number),
+         has_subscription = ?,
+         subscription_provider = 'paypal',
+         subscription_id = ?,
+         subscription_plan = ?,
+         subscription_status = ?,
+         subscription_start_date = ?,
+         subscription_end_date = ?,
+         subscription_cancelled_date = NULL
+     WHERE id = ?`,
+    [
+      accountNumber,
+      subscriptionStatus === "ACTIVE" ? 1 : 0,
+      subscriptionId,
+      subscriptionPlan,
+      subscriptionStatus,
+      startDate,
+      endDate,
+      req.user.id
+    ]
+  );
 
       return res.status(200).json({
         message: "Subscription confirmed.",
+        accountNumber,
         subscription: {
           id: subscriptionId,
           plan: subscriptionPlan,
