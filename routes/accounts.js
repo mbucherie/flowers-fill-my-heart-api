@@ -429,6 +429,242 @@ router.post("/request-confirmation", async (req, res) => {
   }
 });
 
+router.post("/request-password-reset", async (req, res) => {
+  const connection = await pool.getConnection();
+
+  try {
+    const { email } = req.body;
+
+    const genericResponse = {
+      message:
+        "If an account exists for that email address, a password reset link has been sent."
+    };
+
+    if (!email) {
+      connection.release();
+      return res.status(200).json(genericResponse);
+    }
+
+    const normalizedEmail = email.trim().toLowerCase();
+
+    if (!normalizedEmail) {
+      connection.release();
+      return res.status(200).json(genericResponse);
+    }
+
+    await connection.beginTransaction();
+
+    const [users] = await connection.query(
+      `SELECT id, email
+       FROM users
+       WHERE email = ?
+       LIMIT 1
+       FOR UPDATE`,
+      [normalizedEmail]
+    );
+
+    if (users.length === 0) {
+      await connection.rollback();
+      connection.release();
+
+      return res.status(200).json(genericResponse);
+    }
+
+    const user = users[0];
+
+    const resetToken = crypto.randomBytes(32).toString("hex");
+
+    const resetTokenHash = crypto
+      .createHash("sha256")
+      .update(resetToken)
+      .digest("hex");
+
+    const expiresAt = new Date(
+      Date.now() + 1000 * 60 * 60
+    );
+
+    await connection.query(
+      `UPDATE password_reset_tokens
+       SET used_at = NOW()
+       WHERE user_id = ?
+         AND used_at IS NULL`,
+      [user.id]
+    );
+
+    await connection.query(
+      `INSERT INTO password_reset_tokens
+        (user_id, token_hash, expires_at)
+       VALUES (?, ?, ?)`,
+      [
+        user.id,
+        resetTokenHash,
+        expiresAt
+      ]
+    );
+
+    const resetUrl =
+      `https://flowersfillmyheart.com/reset-password?token=${encodeURIComponent(
+        resetToken
+      )}`;
+
+    await sendEmail({
+      to: user.email,
+      subject: "Reset your Flowers Fill My Heart password",
+      text:
+        `You requested a password reset for your Flowers Fill My Heart account.\n\n` +
+        `Please click the link below to reset your password.\n\n` +
+        `This link expires in 1 hour.\n\n` +
+        `${resetUrl}`,
+      html:
+        `<p>You requested a password reset for your Flowers Fill My Heart account.</p>` +
+        `<p>Please click the link below to reset your password.</p>` +
+        `<p>This link expires in 1 hour.</p>` +
+        `<p><a href="${resetUrl}">Reset My Password</a></p>`
+    });
+
+    await connection.commit();
+    connection.release();
+
+    return res.status(200).json(genericResponse);
+
+  } catch (error) {
+    try {
+      await connection.rollback();
+    } catch (rollbackError) {
+      console.error(
+        "PASSWORD RESET REQUEST ROLLBACK ERROR:",
+        rollbackError
+      );
+    }
+
+    connection.release();
+
+    console.error("PASSWORD RESET REQUEST ERROR:", error);
+
+    return res.status(500).json({
+      error: "Unable to request a password reset."
+    });
+  }
+});
+
+router.post("/reset-password", async (req, res) => {
+  const connection = await pool.getConnection();
+
+  try {
+    const { token, password } = req.body;
+
+    if (!token || !password) {
+      connection.release();
+
+      return res.status(400).json({
+        error: "Reset token and new password are required."
+      });
+    }
+
+    if (password.length < 8) {
+      connection.release();
+
+      return res.status(400).json({
+        error: "Password must be at least 8 characters."
+      });
+    }
+
+    const tokenHash = crypto
+      .createHash("sha256")
+      .update(token)
+      .digest("hex");
+
+    await connection.beginTransaction();
+
+    const [rows] = await connection.query(
+      `SELECT id, user_id, expires_at, used_at
+       FROM password_reset_tokens
+       WHERE token_hash = ?
+       LIMIT 1
+       FOR UPDATE`,
+      [tokenHash]
+    );
+
+    if (rows.length === 0) {
+      await connection.rollback();
+      connection.release();
+
+      return res.status(400).json({
+        error: "Invalid or expired password reset link."
+      });
+    }
+
+    const resetToken = rows[0];
+
+    if (resetToken.used_at) {
+      await connection.rollback();
+      connection.release();
+
+      return res.status(400).json({
+        error: "Invalid or expired password reset link."
+      });
+    }
+
+    if (new Date(resetToken.expires_at) <= new Date()) {
+      await connection.rollback();
+      connection.release();
+
+      return res.status(400).json({
+        error: "Invalid or expired password reset link."
+      });
+    }
+
+    const passwordHash = await bcrypt.hash(password, 12);
+
+    await connection.query(
+      `UPDATE users
+       SET password_hash = ?
+       WHERE id = ?`,
+      [
+        passwordHash,
+        resetToken.user_id
+      ]
+    );
+
+    await connection.query(
+      `UPDATE password_reset_tokens
+       SET used_at = NOW()
+       WHERE id = ?`,
+      [resetToken.id]
+    );
+
+    await connection.query(
+      `DELETE FROM sessions
+       WHERE user_id = ?`,
+      [resetToken.user_id]
+    );
+
+    await connection.commit();
+    connection.release();
+
+    return res.status(200).json({
+      message: "Password reset successfully."
+    });
+
+  } catch (error) {
+    try {
+      await connection.rollback();
+    } catch (rollbackError) {
+      console.error(
+        "PASSWORD RESET ROLLBACK ERROR:",
+        rollbackError
+      );
+    }
+
+    connection.release();
+
+    console.error("PASSWORD RESET ERROR:", error);
+
+    return res.status(500).json({
+      error: "Unable to reset password."
+    });
+  }
+});
 
 router.post("/login", async (req, res) => {
   try {
