@@ -429,6 +429,136 @@ router.post("/request-confirmation", async (req, res) => {
   }
 });
 
+router.post("/request-confirmation-by-email", async (req, res) => {
+  const connection = await pool.getConnection();
+
+  const genericResponse = {
+    message:
+      "If an unconfirmed account exists for that email address, a new confirmation link has been sent."
+  };
+
+  try {
+    const { email } = req.body;
+
+    if (!email) {
+      connection.release();
+      return res.status(200).json(genericResponse);
+    }
+
+    const normalizedEmail = email.trim().toLowerCase();
+
+    if (!normalizedEmail) {
+      connection.release();
+      return res.status(200).json(genericResponse);
+    }
+
+    await connection.beginTransaction();
+
+    const [rows] = await connection.query(
+      `SELECT
+        id,
+        email,
+        email_confirmed_at
+       FROM users
+       WHERE email = ?
+       LIMIT 1
+       FOR UPDATE`,
+      [normalizedEmail]
+    );
+
+    if (rows.length === 0) {
+      await connection.rollback();
+      connection.release();
+
+      return res.status(200).json(genericResponse);
+    }
+
+    const user = rows[0];
+
+    if (user.email_confirmed_at) {
+      await connection.rollback();
+      connection.release();
+
+      return res.status(200).json(genericResponse);
+    }
+
+    const newConfirmationToken = crypto.randomBytes(32).toString("hex");
+
+    const newConfirmationTokenHash = crypto
+      .createHash("sha256")
+      .update(newConfirmationToken)
+      .digest("hex");
+
+    const expiresAt = new Date(
+      Date.now() + 1000 * 60 * 60
+    );
+
+    await connection.query(
+      `DELETE FROM account_confirmation_tokens
+       WHERE user_id = ?
+         AND confirmed_at IS NULL`,
+      [user.id]
+    );
+
+    await connection.query(
+      `INSERT INTO account_confirmation_tokens
+        (user_id, token_hash, expires_at)
+       VALUES (?, ?, ?)`,
+      [
+        user.id,
+        newConfirmationTokenHash,
+        expiresAt
+      ]
+    );
+
+    const confirmationUrl =
+      `https://flowersfillmyheart.com/confirm-account?token=${encodeURIComponent(
+        newConfirmationToken
+      )}`;
+
+    await sendEmail({
+      to: user.email,
+      subject: "Confirm your Flowers Fill My Heart account",
+      text:
+        `You have successfully created an account at flowersfillmyheart.com.\n\n` +
+        `Please click the link below to continue your subscription purchase.\n\n` +
+        `This link expires in 1 hour.\n\n` +
+        `${confirmationUrl}`,
+      html:
+        `<p>You have successfully created an account at flowersfillmyheart.com.</p>` +
+        `<p>Please click the link below to continue your subscription purchase.</p>` +
+        `<p>This link expires in 1 hour.</p>` +
+        `<p><a href="${confirmationUrl}">Confirm My Account</a></p>`
+    });
+
+    await connection.commit();
+    connection.release();
+
+    return res.status(200).json(genericResponse);
+
+  } catch (error) {
+    try {
+      await connection.rollback();
+    } catch (rollbackError) {
+      console.error(
+        "REQUEST CONFIRMATION BY EMAIL ROLLBACK ERROR:",
+        rollbackError
+      );
+    }
+
+    connection.release();
+
+    console.error(
+      "REQUEST CONFIRMATION BY EMAIL ERROR:",
+      error
+    );
+
+    return res.status(500).json({
+      error: "Unable to request a new confirmation link."
+    });
+  }
+});
+
 router.post("/request-password-reset", async (req, res) => {
   const connection = await pool.getConnection();
 
