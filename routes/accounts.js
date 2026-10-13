@@ -2,6 +2,7 @@ const express = require("express");
 const bcrypt = require("bcrypt");
 const crypto = require("crypto");
 const pool = require("../db/connection");
+const requireAuth = require("../middleware/auth");
 
 const { sendEmail } = require("../utils/email");
 
@@ -111,7 +112,7 @@ router.post("/create", async (req, res) => {
     );
 
     const confirmationUrl =
-      `https://flowersfillmyheart.com/confirm-account?token=${encodeURIComponent(
+      `${process.env.FRONTEND_URL}/confirm-account?token=${encodeURIComponent(
         confirmationToken
       )}`;
 
@@ -230,9 +231,9 @@ router.get("/confirm-account", async (req, res) => {
       await connection.rollback();
       connection.release();
 
-      return res.status(400).json({
-        error: "This account has already been confirmed."
-      });
+     return res.status(200).json({
+       message: "Account confirmed successfully."
+     });
     }
 
     if (new Date(confirmationToken.expires_at) <= new Date()) {
@@ -370,7 +371,7 @@ router.post("/request-confirmation", async (req, res) => {
     );
 
     const confirmationUrl =
-      `https://flowersfillmyheart.com/confirm-account?token=${encodeURIComponent(
+      `${process.env.FRONTEND_URL}/confirm-account?token=${encodeURIComponent(
         newConfirmationToken
       )}`;
 
@@ -512,7 +513,7 @@ router.post("/request-confirmation-by-email", async (req, res) => {
     );
 
     const confirmationUrl =
-      `https://flowersfillmyheart.com/confirm-account?token=${encodeURIComponent(
+      `${process.env.FRONTEND_URL}/confirm-account?token=${encodeURIComponent(
         newConfirmationToken
       )}`;
 
@@ -813,6 +814,7 @@ router.post("/login", async (req, res) => {
         id,
         account_number,
         email,
+        email_confirmed_at,
         user_id,
         password_hash,
         has_subscription,
@@ -847,6 +849,13 @@ router.post("/login", async (req, res) => {
         error: "Invalid User ID or password."
       });
     }
+
+if (!user.email_confirmed_at) {
+  return res.status(403).json({
+    error: "Please confirm your email address before continuing.",
+    code: "EMAIL_NOT_CONFIRMED"
+  });
+}
 
     const sessionToken = generateSessionToken();
     const tokenHash = hashSessionToken(sessionToken);
@@ -931,6 +940,62 @@ router.post("/login", async (req, res) => {
 
     return res.status(500).json({
       error: "Unable to log out."
+    });
+  }
+});
+
+router.get("/me", requireAuth, async (req, res) => {
+  try {
+    const [users] = await pool.query(
+      `SELECT
+         account_number,
+         email,
+         email_confirmed_at,
+         user_id,
+         has_subscription,
+         subscription_provider,
+         subscription_id,
+         subscription_plan,
+         subscription_status,
+         subscription_start_date,
+         subscription_end_date,
+         subscription_cancelled_date
+       FROM users
+       WHERE id = ?
+       LIMIT 1`,
+      [req.user.id]
+    );
+
+    if (users.length === 0) {
+      return res.status(404).json({
+        error: "Account not found."
+      });
+    }
+
+    const user = users[0];
+
+    return res.status(200).json({
+      user: {
+        accountNumber: user.account_number,
+        email: user.email,
+        emailConfirmedAt: user.email_confirmed_at,
+        userId: user.user_id,
+        hasSubscription: user.has_subscription,
+        subscriptionProvider: user.subscription_provider,
+        subscriptionId: user.subscription_id,
+        subscriptionPlan: user.subscription_plan,
+        subscriptionStatus: user.subscription_status,
+        subscriptionStartDate: user.subscription_start_date,
+        subscriptionEndDate: user.subscription_end_date,
+        subscriptionCancelledDate:
+          user.subscription_cancelled_date
+      }
+    });
+  } catch (error) {
+    console.error("ACCOUNT STATE ERROR:", error);
+
+    return res.status(500).json({
+      error: "Unable to retrieve account information."
     });
   }
 });

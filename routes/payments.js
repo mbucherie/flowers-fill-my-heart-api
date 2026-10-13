@@ -1,10 +1,12 @@
-const express = require("express");
+﻿const express = require("express");
 const paypal = require("@paypal/paypal-server-sdk");
 const crypto = require("crypto");
 
 const pool = require("../db/connection");
 const requireAuth = require("../middleware/auth");
 const paypalClient = require("../config/paypal");
+
+const { sendEmail } = require("../utils/email");
 
 const router = express.Router();
 function generateAccountNumber() {
@@ -47,7 +49,8 @@ async function getPayPalAccessToken() {
         Authorization: `Basic ${credentials}`,
         "Content-Type": "application/x-www-form-urlencoded"
       },
-      body: "grant_type=client_credentials"
+      body: "grant_type=client_credentials",
+      signal: AbortSignal.timeout(15000)
     }
   );
 
@@ -83,6 +86,15 @@ async function verifyPayPalWebhook(req, webhookEvent) {
     transmission_sig: req.headers["paypal-transmission-sig"],
     transmission_time: req.headers["paypal-transmission-time"]
   };
+
+  console.log("PAYPAL WEBHOOK VERIFY HEADERS:", {
+  auth_algo: headers.auth_algo,
+  cert_url: headers.cert_url,
+  transmission_id: headers.transmission_id,
+  transmission_time: headers.transmission_time,
+  has_transmission_sig: Boolean(headers.transmission_sig),
+  webhook_id: webhookId
+});
 
     if (
     !headers.auth_algo ||
@@ -127,6 +139,7 @@ async function verifyPayPalWebhook(req, webhookEvent) {
       ? "api.paypal.com"
       : "api.sandbox.paypal.com";
 
+
   if (
     certUrl.protocol !== "https:" ||
     certUrl.hostname !== expectedCertHost
@@ -155,6 +168,8 @@ async function verifyPayPalWebhook(req, webhookEvent) {
         webhook_id: webhookId,
         webhook_event: webhookEvent
       })
+,
+      signal: AbortSignal.timeout(15000)
     }
   );
 
@@ -167,10 +182,18 @@ async function verifyPayPalWebhook(req, webhookEvent) {
       errorText
     );
 
-    return false;
+    throw new Error(
+      `PayPal webhook verification service returned HTTP ${response.status}.`
+    );
   }
 
   const data = await response.json();
+
+  console.log("PAYPAL WEBHOOK VERIFY RESPONSE:", {
+  status: response.status,
+  verification_status: data.verification_status
+});
+
 
   return data.verification_status === "SUCCESS";
 }
@@ -189,7 +212,6 @@ function toMySQLDate(value) {
   return date.toISOString().slice(0, 10);
 }
 
-
 async function getStoredUserBySubscriptionId(subscriptionId) {
   const [rows] = await pool.query(
     `SELECT
@@ -200,7 +222,6 @@ async function getStoredUserBySubscriptionId(subscriptionId) {
        subscription_start_date,
        subscription_end_date,
        subscription_cancelled_date
-       
      FROM users
      WHERE subscription_id = ?
        AND subscription_provider = 'paypal'
@@ -211,6 +232,61 @@ async function getStoredUserBySubscriptionId(subscriptionId) {
   return rows.length > 0 ? rows[0] : null;
 }
 
+
+async function getStoredSubscriptionAttemptById(attemptId) {
+  const [rows] = await pool.query(
+    `SELECT
+       u.id,
+       u.email,
+       u.subscription_id,
+       u.subscription_plan,
+       u.subscription_status,
+       u.subscription_start_date,
+       u.subscription_end_date,
+       u.subscription_cancelled_date,
+       sa.id AS attempt_db_id,
+       sa.attempt_id,
+       sa.subscription_plan AS attempt_plan,
+       sa.paypal_plan_id,
+       sa.status AS attempt_status,
+       sa.paypal_request_id,
+       sa.paypal_subscription_id,
+       sa.paypal_status_update_time
+     FROM subscription_attempts sa
+     INNER JOIN users u
+       ON u.id = sa.user_id
+     WHERE sa.attempt_id = ?
+     LIMIT 1`,
+    [attemptId]
+  );
+
+  return rows.length > 0 ? rows[0] : null;
+}
+
+
+async function getStoredPayPalUser(subscriptionId, customId) {
+  if (customId) {
+    const attempt =
+      await getStoredSubscriptionAttemptById(customId);
+
+    if (attempt) {
+      if (
+        attempt.paypal_subscription_id &&
+        attempt.paypal_subscription_id !== subscriptionId
+      ) {
+        throw new Error(
+          `PayPal subscription mismatch for attempt ${customId}.`
+        );
+      }
+
+      return attempt;
+    }
+  }
+
+  return getStoredUserBySubscriptionId(subscriptionId);
+}
+
+
 async function getPayPalSubscription(subscriptionId) {
   const response = await subscriptionsController.getSubscription({
     id: subscriptionId
@@ -220,8 +296,716 @@ async function getPayPalSubscription(subscriptionId) {
   return response.result;
 }
 
+// --------------------------------------------------
+// PAYPAL SUBSCRIPTION RECONCILIATION
+// --------------------------------------------------
+
+async function reconcilePayPalSubscription({
+  subscriptionId,
+  expectedUserId = null,
+  expectedAttemptId = null
+}) {
+  if (!subscriptionId) {
+    throw new Error(
+      "PayPal subscription ID is required for reconciliation."
+    );
+  }
+
+  let connection = null;
+
+  try {
+    connection = await pool.getConnection();
+    await connection.beginTransaction();
+
+    // ------------------------------------------------
+    // 1. LOCK THE LOCAL SUBSCRIPTION ATTEMPT + USER
+    // ------------------------------------------------
+
+    let attemptRows;
+
+    if (expectedAttemptId) {
+      [attemptRows] = await connection.query(
+        `SELECT
+           sa.id AS attempt_db_id,
+           sa.user_id,
+           sa.attempt_id,
+           sa.subscription_plan AS attempt_plan,
+           sa.paypal_plan_id,
+           sa.status AS attempt_status,
+           sa.paypal_subscription_id,
+           sa.paypal_status_update_time,
+           u.id,
+           u.email,
+           u.account_number,
+           u.has_subscription,
+           u.subscription_provider,
+           u.subscription_id,
+           u.subscription_plan,
+           u.subscription_status,
+           u.subscription_start_date,
+           u.subscription_end_date,
+           u.subscription_cancelled_date,
+           u.email_confirmed_at
+         FROM subscription_attempts sa
+         INNER JOIN users u
+           ON u.id = sa.user_id
+         WHERE sa.attempt_id = ?
+         LIMIT 1
+         FOR UPDATE`,
+        [expectedAttemptId]
+      );
+    } else {
+      [attemptRows] = await connection.query(
+        `SELECT
+           sa.id AS attempt_db_id,
+           sa.user_id,
+           sa.attempt_id,
+           sa.subscription_plan AS attempt_plan,
+           sa.paypal_plan_id,
+           sa.status AS attempt_status,
+           sa.paypal_subscription_id,
+           sa.paypal_status_update_time,
+           u.id,
+           u.email,
+           u.account_number,
+           u.has_subscription,
+           u.subscription_provider,
+           u.subscription_id,
+           u.subscription_plan,
+           u.subscription_status,
+           u.subscription_start_date,
+           u.subscription_end_date,
+           u.subscription_cancelled_date,
+           u.email_confirmed_at
+         FROM subscription_attempts sa
+         INNER JOIN users u
+           ON u.id = sa.user_id
+         WHERE sa.paypal_subscription_id = ?
+         LIMIT 1
+         FOR UPDATE`,
+        [subscriptionId]
+      );
+    }
+
+    if (attemptRows.length === 0) {
+      await connection.rollback();
+
+      throw new Error(
+        `No local subscription attempt found for PayPal subscription ${subscriptionId}.`
+      );
+    }
+
+    const attempt = attemptRows[0];
+
+    // ------------------------------------------------
+    // 2. VERIFY USER OWNERSHIP WHEN EXPECTED
+    // ------------------------------------------------
+
+    if (
+      expectedUserId !== null &&
+      Number(attempt.user_id) !== Number(expectedUserId)
+    ) {
+      await connection.rollback();
+
+      throw new Error(
+        "PayPal subscription does not belong to the authenticated user."
+      );
+    }
+
+    // ------------------------------------------------
+    // 3. RETRIEVE PAYPAL'S CURRENT AUTHORITATIVE STATE
+    // ------------------------------------------------
+
+    const paypalSubscription =
+      await getPayPalSubscription(subscriptionId);
+
+    if (!paypalSubscription) {
+      await connection.rollback();
+
+      throw new Error(
+        "Unable to retrieve the current PayPal subscription."
+      );
+    }
+
+    if (
+      paypalSubscription.id &&
+      paypalSubscription.id !== subscriptionId
+    ) {
+      await connection.rollback();
+
+      throw new Error(
+        "PayPal returned a different subscription ID."
+      );
+    }
+
+    // ------------------------------------------------
+    // 4. VERIFY PAYPAL CORRELATION
+    // ------------------------------------------------
+
+    const paypalCustomId =
+      paypalSubscription.customId || null;
+
+    if (
+      paypalCustomId &&
+      paypalCustomId !== attempt.attempt_id
+    ) {
+      await connection.rollback();
+
+      throw new Error(
+        "PayPal subscription custom ID does not match the local subscription attempt."
+      );
+    }
+
+    if (
+      attempt.paypal_subscription_id &&
+      attempt.paypal_subscription_id !== subscriptionId
+    ) {
+      await connection.rollback();
+
+      throw new Error(
+        "Local PayPal subscription ID does not match the subscription being reconciled."
+      );
+    }
+
+    // ------------------------------------------------
+    // 5. VERIFY PAYPAL PLAN
+    // ------------------------------------------------
+
+    if (
+      paypalSubscription.planId &&
+      paypalSubscription.planId !== attempt.paypal_plan_id
+    ) {
+      await connection.rollback();
+
+      throw new Error(
+        "PayPal subscription plan does not match the local subscription attempt."
+      );
+    }
+
+    // ------------------------------------------------
+    // 6. COMPARE PAYPAL STATE UPDATE TIME
+    // ------------------------------------------------
+
+    const paypalStatusUpdateTime =
+      paypalSubscription.status_update_time
+        ? new Date(paypalSubscription.status_update_time)
+        : null;
+
+    if (
+      paypalStatusUpdateTime &&
+      Number.isNaN(paypalStatusUpdateTime.getTime())
+    ) {
+      await connection.rollback();
+
+      throw new Error(
+        "PayPal returned an invalid subscription status update time."
+      );
+    }
+
+    const storedStatusUpdateTime =
+      attempt.paypal_status_update_time
+        ? new Date(attempt.paypal_status_update_time)
+        : null;
+
+    if (
+      storedStatusUpdateTime &&
+      Number.isNaN(storedStatusUpdateTime.getTime())
+    ) {
+      await connection.rollback();
+
+      throw new Error(
+        "The stored PayPal subscription status update time is invalid."
+      );
+    }
+
+    if (
+      paypalStatusUpdateTime &&
+      storedStatusUpdateTime &&
+      paypalStatusUpdateTime <= storedStatusUpdateTime
+    ) {
+      await connection.commit();
+      connection.release();
+      connection = null;
+
+      console.log(
+        `PAYPAL RECONCILIATION: Ignoring stale PayPal state for ${subscriptionId}.`,
+        {
+          paypalStatus: paypalSubscription.status,
+          paypalStatusUpdateTime:
+            paypalSubscription.status_update_time,
+          storedStatusUpdateTime:
+            attempt.paypal_status_update_time
+        }
+      );
+
+      return {
+        reconciled: false,
+        stale: true,
+        subscriptionId,
+        status: attempt.subscription_status,
+        hasSubscription:
+          Boolean(attempt.has_subscription),
+        subscriptionEndDate:
+          attempt.subscription_end_date || null
+      };
+    }
+
+    // ------------------------------------------------
+    // 7. DETERMINE THE CURRENT PAYPAL STATE
+    // ------------------------------------------------
+
+    const paypalStatus =
+      paypalSubscription.status;
+
+    const startDate =
+      toMySQLDate(
+        paypalSubscription.startTime
+      );
+
+    const nextBillingDate =
+      toMySQLDate(
+        paypalSubscription.billingInfo?.nextBillingTime
+      );
+
+    const finalPaymentDate =
+      toMySQLDate(
+        paypalSubscription.billingInfo?.finalPaymentTime
+      );
+
+    let hasSubscription = 0;
+    let localStatus = paypalStatus;
+    let subscriptionEndDate = null;
+    let subscriptionCancelledDate = null;
+
+    switch (paypalStatus) {
+      case "ACTIVE":
+        hasSubscription = 1;
+        localStatus = "ACTIVE";
+        subscriptionEndDate =
+          nextBillingDate ||
+          attempt.subscription_end_date ||
+          null;
+        break;
+
+      case "SUSPENDED":
+        hasSubscription = 0;
+        localStatus = "SUSPENDED";
+        subscriptionEndDate =
+          attempt.subscription_end_date ||
+          null;
+        break;
+
+      case "CANCELLED": {
+        localStatus = "CANCELLED";
+
+        subscriptionEndDate =
+          finalPaymentDate ||
+          nextBillingDate ||
+          attempt.subscription_end_date ||
+          null;
+
+        subscriptionCancelledDate =
+          toMySQLDate(
+            paypalSubscription.status_update_time
+          ) ||
+          attempt.subscription_cancelled_date ||
+          toMySQLDate(new Date());
+
+        if (
+          subscriptionEndDate &&
+          new Date(subscriptionEndDate) >= new Date()
+        ) {
+          hasSubscription = 1;
+        } else {
+          hasSubscription = 0;
+        }
+
+        break;
+      }
+
+      case "EXPIRED":
+        hasSubscription = 0;
+        localStatus = "EXPIRED";
+        subscriptionEndDate =
+          attempt.subscription_end_date ||
+          null;
+        break;
+
+      case "APPROVED":
+      case "APPROVAL_PENDING":
+        hasSubscription = 0;
+        localStatus = paypalStatus;
+        subscriptionEndDate =
+          attempt.subscription_end_date ||
+          null;
+        break;
+
+    default:
+  throw new Error(
+    `Unexpected PayPal subscription status: ${paypalStatus || "missing"}`
+  );
+
+      }
+
+
+    // ------------------------------------------------
+    // 8. ASSIGN ACCOUNT NUMBER ONLY WHEN ACTIVE
+    // ------------------------------------------------
+
+    let accountNumber =
+      attempt.account_number || null;
+
+    if (
+      paypalStatus === "ACTIVE" &&
+      !accountNumber
+    ) {
+      accountNumber =
+        await generateUniqueAccountNumber();
+    }
+
+    // ------------------------------------------------
+    // 9. UPDATE USER
+    // ------------------------------------------------
+
+    const [userUpdateResult] = await connection.query(
+      `UPDATE users
+       SET
+         account_number =
+           COALESCE(?, account_number),
+         has_subscription = ?,
+         subscription_provider = 'paypal',
+         subscription_id = ?,
+         subscription_plan = ?,
+         subscription_status = ?,
+         subscription_start_date =
+           COALESCE(?, subscription_start_date),
+         subscription_end_date = ?,
+         subscription_cancelled_date = ?
+       WHERE id = ?
+         AND (
+           subscription_id IS NULL
+           OR subscription_id = ?
+         )`,
+      [
+        accountNumber,
+        hasSubscription,
+        subscriptionId,
+        attempt.attempt_plan,
+        localStatus,
+        startDate,
+        subscriptionEndDate,
+        subscriptionCancelledDate,
+        attempt.user_id,
+        subscriptionId
+      ]
+    );
+    if (userUpdateResult.affectedRows !== 1) {
+      throw new Error(
+        `Unable to update user subscription state for PayPal subscription ${subscriptionId}.`
+      );
+    }
+
+    // ------------------------------------------------
+    // 10. UPDATE SUBSCRIPTION ATTEMPT
+    // ------------------------------------------------
+
+    await connection.query(
+      `UPDATE subscription_attempts
+       SET
+         paypal_subscription_id = ?,
+         status = ?,
+         paypal_status_update_time = 
+         COALESCE(?, paypal_status_update_time)
+       WHERE id = ?`,
+      [
+        subscriptionId,
+        localStatus,
+        paypalStatusUpdateTime
+          ? paypalStatusUpdateTime
+          : null,
+        attempt.attempt_db_id
+      ]
+    );
+
+    await connection.commit();
+
+    connection.release();
+    connection = null;
+
+    console.log(
+      `PAYPAL RECONCILIATION: ${subscriptionId} -> ${paypalStatus}`,
+      {
+        userId: attempt.user_id,
+        hasSubscription,
+        subscriptionEndDate
+      }
+    );
+
+    return {
+      reconciled: true,
+      stale: false,
+      subscriptionId,
+      status: localStatus,
+      paypalStatus,
+      hasSubscription: Boolean(hasSubscription),
+      subscriptionPlan: attempt.attempt_plan,
+      subscriptionStartDate:
+        startDate ||
+        attempt.subscription_start_date ||
+        null,
+      subscriptionEndDate,
+      accountNumber
+    };
+
+  } catch (error) {
+    if (connection) {
+      try {
+        await connection.rollback();
+      } catch (_) {}
+
+      connection.release();
+      connection = null;
+    }
+
+    throw error;
+  }
+}
+
 const subscriptionsController =
   new paypal.SubscriptionsController(paypalClient);
+
+
+router.post("/create-subscription", requireAuth, async (req, res) => {
+  const { plan } = req.body;
+
+  if (plan !== "monthly" && plan !== "annual") {
+    return res.status(400).json({
+      error: "Invalid subscription plan.",
+    });
+  }
+
+  const monthlyPlanId =
+    process.env.PAYPAL_MODE === "live"
+      ? process.env.PAYPAL_MONTHLY_PLAN_ID
+      : "P-8G132203G8934612JNKI6WPY";
+
+  const annualPlanId =
+    process.env.PAYPAL_MODE === "live"
+      ? process.env.PAYPAL_ANNUAL_PLAN_ID
+      : "P-21K59382ES175315GNKI6XWA";
+
+  const paypalPlanId =
+    plan === "monthly" ? monthlyPlanId : annualPlanId;
+
+  let connection;
+
+  try {
+    connection = await pool.getConnection();
+    await connection.beginTransaction();
+
+    // Lock this user row so two simultaneous checkout attempts
+    // cannot create two different internal attempts.
+    const [users] = await connection.query(
+      `SELECT
+         id,
+         email_confirmed_at,
+         has_subscription,
+         subscription_status,
+         subscription_end_date
+       FROM users
+       WHERE id = ?
+       LIMIT 1
+       FOR UPDATE`,
+      [req.user.id]
+    );
+
+    if (users.length === 0) {
+      await connection.rollback();
+      connection.release();
+
+      return res.status(404).json({
+        error: "Account not found.",
+      });
+    }
+
+    const user = users[0];
+
+    if (!user.email_confirmed_at) {
+      await connection.rollback();
+      connection.release();
+
+      return res.status(403).json({
+        error: "Please confirm your email address before continuing.",
+        code: "EMAIL_NOT_CONFIRMED",
+      });
+    }
+
+    // Do not allow creation of another PayPal subscription while
+    // the current subscription is still active.
+    const currentSubscriptionStillActive =
+      user.has_subscription === 1 &&
+      (
+        user.subscription_status === "ACTIVE" ||
+        (
+          user.subscription_status === "CANCELLED" &&
+          user.subscription_end_date &&
+          new Date(user.subscription_end_date) >= new Date()
+        )
+      );
+
+    if (currentSubscriptionStillActive) {
+      await connection.rollback();
+      connection.release();
+
+      return res.status(409).json({
+        error: "You already have an active subscription.",
+      });
+    }
+
+    // Look for an existing checkout attempt for this user.
+    // Reusing it is intentional: it preserves the same
+    // PayPal-Request-Id and therefore the same PayPal operation.
+    const [attempts] = await connection.query(
+      `SELECT
+         id,
+         attempt_id,
+         subscription_plan,
+         paypal_plan_id,
+         status,
+         paypal_request_id,
+         paypal_subscription_id
+       FROM subscription_attempts
+       WHERE user_id = ?
+         AND status NOT IN ('FAILED', 'CANCELLED', 'EXPIRED')
+       ORDER BY id DESC
+       LIMIT 1
+       FOR UPDATE`,
+      [req.user.id]
+    );
+
+    let attempt = attempts.length > 0 ? attempts[0] : null;
+
+    if (attempt && attempt.subscription_plan !== plan) {
+      await connection.rollback();
+      connection.release();
+
+      return res.status(409).json({
+        error: "A subscription checkout is already in progress.",
+      });
+    }
+
+    if (!attempt) {
+      const attemptId = crypto.randomUUID();
+      const paypalRequestId = crypto.randomUUID();
+
+      await connection.query(
+        `INSERT INTO subscription_attempts
+         (
+           user_id,
+           attempt_id,
+           subscription_plan,
+           paypal_plan_id,
+           status,
+           paypal_request_id
+         )
+         VALUES (?, ?, ?, ?, 'PENDING', ?)`,
+        [
+          req.user.id,
+          attemptId,
+          plan,
+          paypalPlanId,
+          paypalRequestId,
+        ]
+      );
+
+      attempt = {
+        attempt_id: attemptId,
+        subscription_plan: plan,
+        paypal_plan_id: paypalPlanId,
+        status: "PENDING",
+        paypal_request_id: paypalRequestId,
+        paypal_subscription_id: null,
+      };
+    }
+
+    await connection.commit();
+    connection.release();
+    connection = null;
+
+    // If PayPal already created the subscription, reuse it.
+    if (attempt.paypal_subscription_id) {
+      return res.status(200).json({
+        subscriptionId: attempt.paypal_subscription_id,
+        attemptId: attempt.attempt_id,
+        status: attempt.status,
+      });
+    }
+
+    console.log("CREATING PAYPAL SUBSCRIPTION ON SERVER");
+    console.log("User ID:", req.user.id);
+    console.log("Subscription attempt:", attempt.attempt_id);
+    console.log("Selected plan:", plan);
+    console.log("PayPal Plan ID:", attempt.paypal_plan_id);
+
+    const paypalResponse =
+      await subscriptionsController.createSubscription({
+        paypalRequestId: attempt.paypal_request_id,
+        body: {
+          planId: attempt.paypal_plan_id,
+          customId: attempt.attempt_id,
+        },
+      });
+
+    const paypalSubscription = paypalResponse.result;
+
+    if (!paypalSubscription?.id) {
+      return res.status(502).json({
+        error: "PayPal did not return a subscription ID.",
+      });
+    }
+
+    // Store the exact PayPal subscription against the internal attempt.
+    // Do not overwrite a terminal webhook status if the webhook won
+    // the race and processed the subscription first.
+    await pool.query(
+      `UPDATE subscription_attempts
+       SET
+         paypal_subscription_id = ?,
+         status = CASE
+           WHEN status IN ('ACTIVE', 'CANCELLED', 'SUSPENDED', 'EXPIRED')
+             THEN status
+           ELSE 'APPROVAL_PENDING'
+         END
+       WHERE user_id = ?
+         AND attempt_id = ?
+         AND paypal_subscription_id IS NULL`,
+      [
+        paypalSubscription.id,
+        req.user.id,
+        attempt.attempt_id,
+      ]
+    );
+
+    return res.status(200).json({
+      subscriptionId: paypalSubscription.id,
+      attemptId: attempt.attempt_id,
+      status: paypalSubscription.status,
+    });
+  } catch (error) {
+    if (connection) {
+      try {
+        await connection.rollback();
+      } catch (_) {}
+      connection.release();
+    }
+
+    console.error("PAYPAL CREATE SUBSCRIPTION ERROR:", error);
+
+    return res.status(500).json({
+      error: "Unable to create the PayPal subscription.",
+    });
+  }
+});
 
 // --------------------------------------------------
 // CONFIRM PAYPAL SUBSCRIPTION
@@ -231,15 +1015,15 @@ router.post(
   "/confirm-subscription",
   requireAuth,
   async (req, res) => {
+    const { subscriptionId } = req.body;
+
+    if (!subscriptionId) {
+      return res.status(400).json({
+        error: "PayPal subscription ID is required."
+      });
+    }
+
     try {
-      const { subscriptionId } = req.body;
-
-      if (!subscriptionId) {
-        return res.status(400).json({
-          error: "PayPal subscription ID is required."
-        });
-      }
-
       // Retrieve the subscription directly from PayPal.
       const paypalSubscription =
         await getPayPalSubscription(subscriptionId);
@@ -250,94 +1034,194 @@ router.post(
         });
       }
 
-      // The subscription must belong to the PayPal
-      // account/environment configured for this server.
-      const planId = paypalSubscription.planId;
+      // PayPal custom_id must identify the internal
+      // subscription attempt created for this user.
+      const customId =
+        paypalSubscription.customId;
 
-      if (!planId) {
+      if (!customId) {
         return res.status(400).json({
-          error: "PayPal subscription plan could not be determined."
+          error:
+            "PayPal subscription could not be correlated to this checkout."
         });
       }
 
-      let subscriptionPlan = null;
+      // Find the exact pending attempt belonging to
+      // the authenticated user.
+      const [attemptRows] = await pool.query(
+        `SELECT
+           sa.id,
+           sa.attempt_id,
+           sa.user_id,
+           sa.subscription_plan,
+           sa.paypal_plan_id,
+           sa.status AS attempt_status,
+           sa.paypal_subscription_id,
+           u.has_subscription,
+           u.subscription_id,
+           u.subscription_status,
+           u.account_number,
+           u.email_confirmed_at
+         FROM subscription_attempts sa
+         INNER JOIN users u
+           ON u.id = sa.user_id
+         WHERE sa.attempt_id = ?
+           AND sa.user_id = ?
+         LIMIT 1`,
+        [
+          customId,
+          req.user.id
+        ]
+      );
+
+      if (attemptRows.length === 0) {
+        return res.status(403).json({
+          error:
+            "This PayPal subscription does not belong to your checkout."
+        });
+      }
+
+      const attempt = attemptRows[0];
+
+      if (!attempt.email_confirmed_at) {
+        return res.status(403).json({
+          error:
+            "Please confirm your email address before continuing.",
+          code: "EMAIL_NOT_CONFIRMED"
+        });
+      }
+
+      // The PayPal subscription ID must match the
+      // subscription created for this exact attempt.
+      if (
+        attempt.paypal_subscription_id &&
+        attempt.paypal_subscription_id !== subscriptionId
+      ) {
+        return res.status(409).json({
+          error:
+            "PayPal subscription could not be matched to this checkout.",
+          code: "SUBSCRIPTION_MISMATCH"
+        });
+      }
+
+      // The PayPal plan must match the plan selected
+      // for the internal checkout attempt.
+      const monthlyPlanId =
+        process.env.PAYPAL_MODE === "live"
+          ? process.env.PAYPAL_MONTHLY_PLAN_ID
+          : "P-8G132203G8934612JNKI6WPY";
+
+      const annualPlanId =
+        process.env.PAYPAL_MODE === "live"
+          ? process.env.PAYPAL_ANNUAL_PLAN_ID
+          : "P-21K59382ES175315GNKI6XWA";
 
       if (
-        planId === "P-8G132203G8934612JNKI6WPY"
+        attempt.subscription_plan === "monthly" &&
+        paypalSubscription.planId !== monthlyPlanId
       ) {
-        subscriptionPlan = "monthly";
-      } else if (
-        planId === "P-21K59382ES175315GNKI6XWA"
-      ) {
-        subscriptionPlan = "annual";
-      } else {
-        return res.status(400).json({
-          error: "Unknown PayPal subscription plan."
+        return res.status(409).json({
+          error:
+            "The PayPal subscription plan does not match your selected plan.",
+          code: "SUBSCRIPTION_PLAN_MISMATCH"
         });
       }
 
-      const subscriptionStatus =
-        paypalSubscription.status;
-
-      const startDate = toMySQLDate(
-        paypalSubscription.startTime
-      );
-
-      const endDate = toMySQLDate(
-        paypalSubscription
-          .billingInfo
-          ?.nextBillingTime
-      );
-
-       // Generate an account number only after successful
-      // confirmation of an ACTIVE PayPal subscription.
-      let accountNumber = null;
-
-      if (subscriptionStatus === "ACTIVE") {
-        const [currentUser] = await pool.query(
-          "SELECT account_number FROM users WHERE id = ? LIMIT 1",
-          [req.user.id]
-        );
-
-       accountNumber = currentUser[0]?.account_number || null;
-
-       if (!accountNumber) {
-          accountNumber = await generateUniqueAccountNumber();
-        }
+      if (
+        attempt.subscription_plan === "annual" &&
+        paypalSubscription.planId !== annualPlanId
+      ) {
+        return res.status(409).json({
+          error:
+            "The PayPal subscription plan does not match your selected plan.",
+          code: "SUBSCRIPTION_PLAN_MISMATCH"
+        });
       }
-   await pool.query(
-    `UPDATE users
-     SET account_number = COALESCE(?, account_number),
-         has_subscription = ?,
-         subscription_provider = 'paypal',
-         subscription_id = ?,
-         subscription_plan = ?,
-         subscription_status = ?,
-         subscription_start_date = ?,
-         subscription_end_date = ?,
-         subscription_cancelled_date = NULL
-     WHERE id = ?`,
-    [
-      accountNumber,
-      subscriptionStatus === "ACTIVE" ? 1 : 0,
-      subscriptionId,
-      subscriptionPlan,
-      subscriptionStatus,
-      startDate,
-      endDate,
-      req.user.id
-    ]
-  );
 
+      // Keep the internal attempt synchronized with the
+      // exact PayPal subscription, but do NOT activate the
+      // local user here.
+      await pool.query(
+        `UPDATE subscription_attempts
+         SET
+           paypal_subscription_id =
+             COALESCE(paypal_subscription_id, ?),
+           status =
+             CASE
+               WHEN status = 'PENDING'
+                 THEN 'APPROVAL_PENDING'
+               ELSE status
+             END
+         WHERE id = ?
+           AND user_id = ?
+           AND (
+             paypal_subscription_id IS NULL
+             OR paypal_subscription_id = ?
+           )`,
+        [
+          subscriptionId,
+          attempt.id,
+          req.user.id,
+          subscriptionId
+        ]
+      );
+
+      // ------------------------------------------------
+      // IMPORTANT:
+      // PayPal approval does NOT activate Premium.
+      // Only the verified webhook may do that.
+      // ------------------------------------------------
+
+      if (
+        paypalSubscription.status === "ACTIVE" &&
+        attempt.has_subscription === 1 &&
+        attempt.subscription_id === subscriptionId &&
+        attempt.subscription_status === "ACTIVE"
+      ) {
+        return res.status(200).json({
+          message:
+            "Your subscription has been verified.",
+          verified: true,
+          verificationPending: false,
+          accountNumber: attempt.account_number,
+          subscription: {
+            id: subscriptionId,
+            plan: attempt.subscription_plan,
+            status: "ACTIVE"
+          }
+        });
+      }
+
+      if (
+        paypalSubscription.status === "CANCELLED" ||
+        paypalSubscription.status === "EXPIRED" ||
+        paypalSubscription.status === "SUSPENDED"
+      ) {
+        return res.status(409).json({
+          error:
+            "Your PayPal subscription could not be verified as active.",
+          code: "SUBSCRIPTION_NOT_ACTIVE",
+          verified: false,
+          verificationPending: false,
+          subscription: {
+            id: subscriptionId,
+            plan: attempt.subscription_plan,
+            status: paypalSubscription.status
+          }
+        });
+      }
+
+      // PayPal may be approved/created while the
+      // authoritative activation webhook is still pending.
       return res.status(200).json({
-        message: "Subscription confirmed.",
-        accountNumber,
+        message:
+          "Your PayPal subscription has been received and is being verified.",
+        verified: false,
+        verificationPending: true,
         subscription: {
           id: subscriptionId,
-          plan: subscriptionPlan,
-          status: subscriptionStatus,
-          startDate,
-          endDate
+          plan: attempt.subscription_plan,
+          status: paypalSubscription.status
         }
       });
 
@@ -351,13 +1235,12 @@ router.post(
       );
 
       return res.status(500).json({
-        error: "Unable to confirm subscription."
+        error: "Unable to verify subscription."
       });
     }
   }
 );
-
-
+     
 // --------------------------------------------------
 // CANCEL PAYPAL SUBSCRIPTION
 // --------------------------------------------------
@@ -526,15 +1409,14 @@ function requiresPayPalSubscriptionLookup(eventType) {
   }
 }
 
-
 // --------------------------------------------------
 // PAYPAL WEBHOOK ROUTE
 // --------------------------------------------------
 
 router.post(
   "/paypal-webhook",
-  express.raw({ type: "application/json" }),
-  async (req, res) => {
+   async (req, res) => {
+    console.log("PAYPAL WEBHOOK ROUTE REACHED");
         let connection = null; 
 
          try {
@@ -668,488 +1550,173 @@ router.post(
         });
       }
 
-      // ------------------------------------------------
-      // 5. FIND LOCAL USER
-      // ------------------------------------------------
-
-      const user =
-        await getStoredUserBySubscriptionId(
-          subscriptionId
-        );
-
-      if (!user) {
-        console.log(
-          `PAYPAL WEBHOOK: No local user found for subscription ${subscriptionId}.`
-        );
-
-        // The event is valid and was successfully received.
-        // The subscription simply has not been associated
-        // with a local account yet.
-        return res.status(200).json({
-          received: true,
-          processed: false,
-          eventType
-        });
-      }
-
-      // ------------------------------------------------
-      // 6. GET CURRENT PAYPAL SUBSCRIPTION WHEN NEEDED
-      // ------------------------------------------------
-
-      let paypalSubscription = null;
-
-      if (
-        requiresPayPalSubscriptionLookup(eventType)
-      ) {
-        paypalSubscription =
-          await getPayPalSubscription(
-            subscriptionId
-          );
-      }
-
-      // ------------------------------------------------
-      // 7. HANDLE EACH EVENT DELIBERATELY
-      // ------------------------------------------------
-
-      connection = await pool.getConnection();
-
-      console.log("PAYPAL WEBHOOK: Signature verified");
-
-      await connection.beginTransaction();
-
-      switch (eventType) {
-
-        // ----------------------------------------------
-        // SUBSCRIPTION CREATED
-        // ----------------------------------------------
-
-        case "BILLING.SUBSCRIPTION.CREATED": {
-          // Creation alone does not grant Premium access.
-          // confirm-subscription / ACTIVATED handles activation.
-
-          console.log(
-            `PAYPAL WEBHOOK: Subscription created ${subscriptionId}.`
-          );
-
-          break;
-        }
-
-
-        // ----------------------------------------------
-        // SUBSCRIPTION ACTIVATED
-        // ----------------------------------------------
-
-        case "BILLING.SUBSCRIPTION.ACTIVATED": {
-          if (
-            !paypalSubscription ||
-            paypalSubscription.status !== "ACTIVE"
-          ) {
-            console.error(
-              `PAYPAL WEBHOOK: ACTIVATED event but PayPal subscription is not ACTIVE: ${subscriptionId}`
-            );
-
-            break;
-          }
-
-          const startDate = toMySQLDate(
-            paypalSubscription.startTime
-          );
-
-          const endDate = toMySQLDate(
-            paypalSubscription.billingInfo?.nextBillingTime
-          );
-
-          await connection.query(
-            `UPDATE users
-             SET has_subscription = 1,
-                 subscription_status = 'ACTIVE',
-                 subscription_start_date =
-                   COALESCE(?, subscription_start_date),
-                 subscription_end_date =
-                   COALESCE(?, subscription_end_date),
-                 subscription_cancelled_date = NULL
-                 
-             WHERE id = ?
-               AND subscription_id = ?
-               AND subscription_provider = 'paypal'`,
-            [
-              startDate,
-              endDate,
-              user.id,
-              subscriptionId
-            ]
-          );
-
-          console.log(
-            `PAYPAL WEBHOOK: Subscription activated ${subscriptionId}.`
-          );
-
-          break;
-        }
-
-
-        // ----------------------------------------------
-        // SUBSCRIPTION UPDATED
-        // ----------------------------------------------
-
-        case "BILLING.SUBSCRIPTION.UPDATED": {
-          if (!paypalSubscription) {
-            break;
-          }
-
-          const paypalStatus =
-            paypalSubscription.status;
-
-          const nextBillingDate =
-            toMySQLDate(
-              paypalSubscription
-                .billingInfo
-                ?.nextBillingTime
-            );
-
-          const startDate =
-            toMySQLDate(
-              paypalSubscription.startTime
-            );
-
-          // Only synchronize known PayPal states.
-          if (
-            paypalStatus === "ACTIVE"
-          ) {
-            await connection.query(
-              `UPDATE users
-               SET has_subscription = 1,
-                   subscription_status = 'ACTIVE',
-                   subscription_start_date =
-                     COALESCE(?, subscription_start_date),
-                   subscription_end_date =
-                     COALESCE(?, subscription_end_date),
-                   subscription_cancelled_date = NULL
-                 
-               WHERE id = ?
-                 AND subscription_id = ?
-                 AND subscription_provider = 'paypal'`,
-              [
-                startDate,
-                nextBillingDate,
-                user.id,
-                subscriptionId
-              ]
-            );
-          } else if (
-            paypalStatus === "SUSPENDED"
-          ) {
-            await connection.query(
-              `UPDATE users
-               SET subscription_status = 'SUSPENDED'
-               WHERE id = ?
-                 AND subscription_id = ?
-                 AND subscription_provider = 'paypal'`,
-              [
-                user.id,
-                subscriptionId
-              ]
-            );
-          } else if (
-            paypalStatus === "CANCELLED"
-          ) {
-            const endDate =
-              nextBillingDate ||
-              user.subscription_end_date;
-
-            await connection.query(
-              `UPDATE users
-               SET subscription_status = 'CANCELLED',
-                   subscription_end_date =
-                     COALESCE(?, subscription_end_date),
-                   subscription_cancelled_date =
-                     COALESCE(
-                       subscription_cancelled_date,
-                       CURRENT_DATE
-                     )
-                   
-               WHERE id = ?
-                 AND subscription_id = ?
-                 AND subscription_provider = 'paypal'`,
-              [
-                endDate,
-                user.id,
-                subscriptionId
-              ]
-            );
-          } else if (
-            paypalStatus === "EXPIRED"
-          ) {
-            await connection.query(
-              `UPDATE users
-               SET has_subscription = 0,
-                   subscription_status = 'EXPIRED'
-               WHERE id = ?
-                 AND subscription_id = ?
-                 AND subscription_provider = 'paypal'`,
-              [
-                user.id,
-                subscriptionId
-              ]
-            );
-          }
-
-          console.log(
-            `PAYPAL WEBHOOK: Subscription updated ${subscriptionId} -> ${paypalStatus}`
-          );
-
-          break;
-        }
-
-
-        // ----------------------------------------------
-        // PAYMENT SUCCEEDED
-        // ----------------------------------------------
-
-        case "BILLING.SUBSCRIPTION.PAYMENT.SUCCEEDED": {
-          if (!paypalSubscription) {
-            break;
-          }
-
-          const paypalStatus =
-            paypalSubscription.status;
-
-          const nextBillingDate =
-            toMySQLDate(
-              paypalSubscription
-                .billingInfo
-                ?.nextBillingTime
-            );
-
-          // A successful payment should not blindly
-          // reactivate a subscription.
-          //
-          // We use PayPal's CURRENT subscription status
-          // as the authority.
-
-          if (
-            paypalStatus === "ACTIVE"
-          ) {
-            await connection.query(
-              `UPDATE users
-               SET has_subscription = 1,
-                   subscription_status = 'ACTIVE',
-                   subscription_end_date =
-                     COALESCE(?, subscription_end_date),
-                   subscription_cancelled_date = NULL
-                  
-               WHERE id = ?
-                 AND subscription_id = ?
-                 AND subscription_provider = 'paypal'`,
-              [
-                nextBillingDate,
-                user.id,
-                subscriptionId
-              ]
-            );
-          }
-
-          console.log(
-            `PAYPAL WEBHOOK: Payment succeeded for ${subscriptionId}. Current PayPal status: ${paypalStatus}`
-          );
-
-          break;
-        }
-
-
-        // ----------------------------------------------
-        // PAYMENT.SALE.COMPLETED
-        // ----------------------------------------------
-
-        case "PAYMENT.SALE.COMPLETED": {
-          // This is a payment notification.
-          //
-          // billing_agreement_id is the subscription ID
-          // for this event format.
-          //
-          // We deliberately DO NOT change the local
-          // subscription state here.
-          //
-          // The subscription lifecycle events are
-          // responsible for subscription state.
-
-          console.log(
-            `PAYPAL WEBHOOK: Sale completed for subscription ${subscriptionId}.`
-          );
-
-          break;
-        }
-
-
-        // ----------------------------------------------
-        // PAYMENT FAILED
-        // ----------------------------------------------
-
-        case "BILLING.SUBSCRIPTION.PAYMENT.FAILED": {
-          if (!paypalSubscription) {
-            break;
-          }
-
-          const paypalStatus =
-            paypalSubscription.status;
-
-          // A failed payment is NOT automatically treated
-          // as SUSPENDED.
-          //
-          // PayPal's current subscription status is the
-          // authoritative state.
-
-          if (
-            paypalStatus === "SUSPENDED"
-          ) {
-            await connection.query(
-              `UPDATE users
-               SET subscription_status = 'SUSPENDED'
-               WHERE id = ?
-                 AND subscription_id = ?
-                 AND subscription_provider = 'paypal'`,
-              [
-                user.id,
-                subscriptionId
-              ]
-            );
-          }
-
-          console.log(
-            `PAYPAL WEBHOOK: Payment failed for ${subscriptionId}. Current PayPal status: ${paypalStatus}`
-          );
-
-          break;
-        }
-
-
-        // ----------------------------------------------
-        // SUBSCRIPTION CANCELLED
-        // ----------------------------------------------
-
-        case "BILLING.SUBSCRIPTION.CANCELLED": {
-          if (!paypalSubscription) {
-            break;
-          }
-
-          const endDate =
-            toMySQLDate(
-              paypalSubscription
-                .billingInfo
-                ?.nextBillingTime
-            ) ||
-            user.subscription_end_date;
-
-        
-          await connection.query(
-            `UPDATE users
-             SET has_subscription = 1,
-                 subscription_status = 'CANCELLED',
-                 subscription_end_date =
-                   COALESCE(?, subscription_end_date),
-                 subscription_cancelled_date =
-                   COALESCE(
-                     subscription_cancelled_date,
-                     CURRENT_DATE
-                   )
-                 
-             WHERE id = ?
-               AND subscription_id = ?
-               AND subscription_provider = 'paypal'`,
-            [
-              endDate,
-              user.id,
-              subscriptionId
-            ]
-          );
-
-          console.log(
-            `PAYPAL WEBHOOK: Subscription cancelled ${subscriptionId}.`
-          );
-
-          break;
-        }
-
-
-        // ----------------------------------------------
-        // SUBSCRIPTION SUSPENDED
-        // ----------------------------------------------
-
-        case "BILLING.SUBSCRIPTION.SUSPENDED": {
-          await connection.query(
-            `UPDATE users
-             SET subscription_status = 'SUSPENDED'
-             WHERE id = ?
-               AND subscription_id = ?
-               AND subscription_provider = 'paypal'`,
-            [
-              user.id,
-              subscriptionId
-            ]
-          );
-
-          console.log(
-            `PAYPAL WEBHOOK: Subscription suspended ${subscriptionId}.`
-          );
-
-          break;
-        }
-
-
-        // ----------------------------------------------
-        // SUBSCRIPTION EXPIRED
-        // ----------------------------------------------
-
-        case "BILLING.SUBSCRIPTION.EXPIRED": {
-          await connection.query(
-            `UPDATE users
-             SET has_subscription = 0,
-                 subscription_status = 'EXPIRED'
-             WHERE id = ?
-               AND subscription_id = ?
-               AND subscription_provider = 'paypal'`,
-            [
-              user.id,
-              subscriptionId
-            ]
-          );
-
-          console.log(
-            `PAYPAL WEBHOOK: Subscription expired ${subscriptionId}.`
-          );
-
-          break;
-        }
-
-
-        // ----------------------------------------------
-        // UNKNOWN EVENT
-        // ----------------------------------------------
-
-        default: {
-          console.log(
-            `PAYPAL WEBHOOK: Event ignored: ${eventType}`
-          );
-
-          break;
-        }
-      }
-
-      // ------------------------------------------------
-      // 8. RECORD SUCCESSFULLY PROCESSED WEBHOOK
-      // ------------------------------------------------
-
-      await connection.query(
-        `INSERT INTO paypal_webhook_events
-           (event_id, event_type)
-         VALUES (?, ?)`,
-        [eventId, eventType]
-      );
-
-     await connection.commit();
-
-     connection.release();
-     connection = null;
+    // ------------------------------------------------
+// 5. FIND LOCAL USER
+// ------------------------------------------------
+
+const customId =
+  resource?.custom_id || null;
+
+const user =
+  await getStoredPayPalUser(
+    subscriptionId,
+    customId
+  );
+
+if (!user) {
+  console.log(
+    `PAYPAL WEBHOOK: No local user found for subscription ${subscriptionId}.`
+  );
+
+  // This may be a valid PayPal event that does not
+  // belong to a Flowers Fill My Heart checkout.
+  return res.status(200).json({
+    received: true,
+    processed: false,
+    eventType
+  });
+}
+
+// ------------------------------------------------
+// 6. STATE RECONCILIATION IS HANDLED BELOW
+// ------------------------------------------------
+//
+// State-changing subscription events use
+// reconcilePayPalSubscription(), which retrieves
+// PayPal's current authoritative state and manages
+// its own database transaction.
+//
+// CREATED and non-state-changing events continue
+// through the webhook transaction below.
+
+console.log("PAYPAL WEBHOOK: Signature verified");
+
+   
+// ------------------------------------------------
+// 7. RECONCILE PAYPAL SUBSCRIPTION STATE
+// ------------------------------------------------
+
+if (requiresPayPalSubscriptionLookup(eventType)) {
+  try {
+    const reconciliationResult =
+      await reconcilePayPalSubscription({
+        subscriptionId,
+        expectedUserId: user.id,
+        expectedAttemptId: user.attempt_id || null
+      });
+
+    console.log(
+      `PAYPAL WEBHOOK: Reconciliation completed for ${subscriptionId}.`,
+      reconciliationResult
+    );
+  } catch (reconciliationError) {
+    console.error(
+      `PAYPAL WEBHOOK: Reconciliation failed for ${subscriptionId}:`,
+      reconciliationError.message
+    );
+
+    throw reconciliationError;
+  }
+} else if (
+  eventType === "BILLING.SUBSCRIPTION.CREATED"
+) {
+  // Creation alone does not grant Premium.
+  // The subscription remains pending until PayPal
+  // reaches an authoritative active state.
+
+  console.log(
+    `PAYPAL WEBHOOK: Subscription created ${subscriptionId}.`
+  );
+} else if (
+  eventType === "PAYMENT.SALE.COMPLETED"
+) {
+  // This is a payment notification.
+  // It deliberately does not change subscription state.
+
+  console.log(
+    `PAYPAL WEBHOOK: Sale completed for subscription ${subscriptionId}.`
+  );
+} else {
+  // Unknown webhook event types are ignored.
+  //
+  // They must never create an UNKNOWN subscription
+  // state for the customer.
+
+  console.log(
+    `PAYPAL WEBHOOK: Event ignored: ${eventType}`
+  );
+}
+// ------------------------------------------------
+// 8. RECORD SUCCESSFULLY PROCESSED WEBHOOK
+// ------------------------------------------------
+
+connection = await pool.getConnection();
+
+try {
+  await connection.beginTransaction();
+
+  await connection.query(
+    `INSERT INTO paypal_webhook_events
+      (
+        event_id,
+        event_type,
+        subscription_id,
+        user_id,
+        attempt_id,
+        paypal_status,
+        transmission_time,
+        processed_at,
+        processing_status
+      )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      eventId,
+      eventType,
+      subscriptionId,
+      user.id,
+      user.attempt_id || null,
+      null,
+      webhookEvent?.create_time
+        ? toMySQLDate(webhookEvent.create_time)
+        : null,
+      toMySQLDate(new Date()),
+      "PROCESSED"
+    ]
+  );
+
+  await connection.commit();
+
+  connection.release();
+  connection = null;
+} catch (recordError) {
+  try {
+    await connection.rollback();
+  } catch (rollbackError) {
+    console.error(
+      "PAYPAL WEBHOOK RECORD ROLLBACK ERROR:",
+      rollbackError
+    );
+  }
+
+  connection.release();
+  connection = null;
+
+   if (recordError.code === "ER_DUP_ENTRY") {
+    console.log(
+      `PAYPAL WEBHOOK: Duplicate event already recorded: ${eventId}`
+    );
+
+    return res.status(200).json({
+      received: true,
+      processed: false,
+      duplicate: true,
+      eventType
+    });
+  }
+
+
+  throw recordError;
+}
 
       // ------------------------------------------------
       // 9. SUCCESSFUL RECEIPT
@@ -1195,3 +1762,5 @@ router.post(
 
 
 module.exports = router;
+
+

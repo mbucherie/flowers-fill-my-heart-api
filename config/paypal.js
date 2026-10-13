@@ -1,4 +1,4 @@
-const {
+﻿const {
   Client,
   Environment,
 } = require("@paypal/paypal-server-sdk");
@@ -12,6 +12,7 @@ const paypalClient = new Client({
     process.env.PAYPAL_MODE === "live"
       ? Environment.Production
       : Environment.Sandbox,
+  timeout: 30000,
 });
 
 module.exports = paypalClient;
